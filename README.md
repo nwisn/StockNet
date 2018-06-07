@@ -7,4 +7,4 @@ We applied unsupervised machine learning methods to US stock market data over th
 ### Link to notebook
 [A Systems Analysis of the US Stock Market](https://nwisn.github.io/StockNet/notebook.html).
 
-![](https://nwisn.github.io/StockNet/module_eigenstock.png)
+![eigenstocks](https://nwisn.github.io/StockNet/module_eigenstocks.png)
