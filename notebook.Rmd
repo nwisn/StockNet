@@ -1,0 +1,859 @@
+---
+title: 'A Systems Analysis of the US Stock Market'
+subtitle: 'During the Years 1992-2017'
+author: "Nicholas Wisniewski"
+date: "July 29, 2017"
+output:
+  html_document:
+    code_folding: hide
+    theme: paper
+    number_sections: true
+    toc: yes
+    toc_depth: '2'
+  html_notebook:
+    toc: yes
+    toc_depth: 2
+  pdf_document:
+    toc: yes
+    toc_depth: '2'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE)
+```
+
+# Introduction
+
+In this study, we applied unsupervised machine learning methods to US stock market data over the years 1992-2017, to identify systemic features and temporal trends, with reference to 9 major economic events in that window (e.g. the dot-com bubble, the Lehman Brother's bankruptcy, etc.). We began by using principal component analysis (PCA) to obtain a spectral decomposition of adjusted closing prices over time, and identified the temporal features associated with each eigenvector. Analysis of industrial classification codes for stocks with highest correlation to each eigenvector was able to correctly identify industries and sectors affected by each economic event. Next, we used a weighted correlation network to refine our analysis by first identifying stock modules based on topological overlap, and then taking the leading eigenvector in the spectral decomposition for each module. Our analysis found that this approach was able to identify more nuanced temporal trends within the principal component of variation.
+
+There has been an emerging interest in using network analysis to model the stock market. A brief review of the literature can be found in [Yang et al.](http://snap.stanford.edu/class/cs224w-2015/projects_2015/Network_Analysis_of_the_Stock_Market.pdf), which provides the following summary:
+
+> "Past studies about network analysis for stock market can be classified into three categories: (1) applying network analysis techniques for different markets and analyze the topological characteristics of each market[2, 4]; (2) propose different correlation metric analysis among various stock markets to suggest different definitions of edges between stocks and study the impact on the network using different edge definitions[7, 11]; (3) stocks selection for portfolio management using the information from the network analysis and benchmark the portfolio performance against indexes[14].
+
+> "Although some promising results have been achieved for stock network analysis, the existing works have certain limitations. The first limitation is the limited work on useful visualization of the constructed network. The primary focuses of previous work were normally on looking at some basis characteristics of constructed network, for instance, correlation distribution, degree distribution (e.g., whether it follows a power-law distribution), and clustering coefficient. These characteristics, however, do not offer people an intuitive way of improving understanding of the stock market, and are also not very helpful in providing direct guidance of market performance and investment.
+
+> "The second limitation exists in the strategy of portfolio management. The existing work only mentions about diversifying the investment portfolio by choosing less correlated stocks, but does not provide a quantitative approach to achieve better portfolio. We think it would be very interesting to establish such kind of quantitative analysis by using the characteristics of the network (e.g. centrality). In particular, we can optimize the return function using network features in a machine learning framework."
+
+
+# Download Data
+
+To begin, we downloaded the stock market data using the `quantmod` package in the following way. First, we defined a start and end date for the data record we will grab, as well as the sampling rate within that time. For this analysis, we downloaded daily records over the past 25 years.
+
+```{r, message=F}
+end_date <- Sys.Date() # get data up until today's date
+start_date <- seq(end_date, length=2, by="-25 years")[2] # use past 25 years 
+periodicity <- "daily" # get daily data
+```
+
+```{r, echo = F, message=F}
+# we do this for the sake of the original document
+start_date <- "1992-07-10"
+end_date <- "2017-07-10"
+```
+
+We download data using the `getSymbols` function in `quantmod`. This function can download from a number of sources, including Yahoo and Google. The format that is returned is shown below, using Apple Inc. (AAPL) as an example:
+
+```{r, message=F, echo=F}
+require(quantmod)
+AAPL <- getSymbols("AAPL", 
+                    from = start_date, 
+                    src = "yahoo", 
+                    auto.assign = FALSE, 
+                    adjust = FALSE,
+                    periodicity = "daily")
+```
+
+```{r, message=F, echo =F}
+require(knitr)
+require(kableExtra)
+kable(as.data.frame(AAPL[1:5,]), format = "html", digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+
+The output format is an `xts` time-series object, where each row is a date. The columns that Yahoo returns include the opening and closing price, the high and low price, the volume, and the *adjusted* price. The idea of an *adjusted* price is that it takes into account splits and dividends, which is information that is hidden by only looking at the closing price. Unfortunately, the adjusted close of Yahoo data is currently incomplete, and doesn’t account for dividends ([Longmore](https://robotwealth.com/solved-errors-downloading-stock-price-data-yahoo-finance/)). The recommended procedure is to use the `adjustOHLC` function, which pulls the split and dividend data from Yahoo, and calculates the ratios manually ([Ulrich](https://quant.stackexchange.com/questions/7526/how-to-detect-and-adjust-for-stock-splits)). Because we had to do this in a loop over all stocks, we wrote a wrapper for the download and adjustment.
+
+```{r, message=F}
+get_adjusted_xts <- function(symbol, start_date, periodicity)
+{
+    xts_object <- getSymbols(symbol, 
+                             from = start_date, 
+                             src = "yahoo", 
+                             auto.assign = FALSE, 
+                             adjust = FALSE,
+                             periodicity = "daily")
+    xts_object.adjusted <- adjustOHLC(xts_object, 
+                                      adjust = c("split", "dividend"), 
+                                      use.Adjusted = FALSE, 
+                                      symbol.name = symbol)
+    return(xts_object.adjusted)
+}
+```
+
+
+We selected all stocks from AMEX, NASDAQ, and NYSE. This was done using the `stockSymbols` function, which returns the symbol, full name, last sale, market cap, IPO year, Sector, Industry, and Exchange. This metadata is necessary later for identifying industry and sector patterns in stock clusters. 
+
+```{r, message=F, echo=F}
+this_kable <- head(stockSymbols())
+kable(this_kable, format = "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+```{r}
+suppressMessages(invisible(stocksList <- stockSymbols()))
+all_symbols <- stocksList[,1]
+```
+
+
+Finally, we downloaded all the stock data, and saved it into an `.RData` file. This procedure takes a long time since there are several thousand symbols to download. 
+
+```{r, eval = F, message=F}
+# Download all the stock data
+adjusted_stocks <- list()
+num_stocks = length(all_symbols)
+maxretryattempts = 5
+for (i in 1:num_stocks){
+    for(t in 1:maxretryattempts){
+        tryCatch(
+            {
+                if(!is.null(eval(parse(
+                    text = paste("adjusted_stocks$", 
+                                 all_symbols[i], 
+                                 sep=""))))){
+                                    break
+                                 }
+                cat("(",i,"/",num_stocks,") ",
+                    "Downloading ", 
+                    all_symbols[i] , 
+                    "\t\t Attempt: ", 
+                    t , 
+                    "/", 
+                    maxretryattempts,"\n")
+                adjusted_stocks[[all_symbols[i]]] <- get_adjusted_xts(all_symbols[i], 
+                                                                   start_date = start_date,
+                                                                   periodicity = periodicity)
+            }
+            , error = function(e) print(e))
+    }
+}
+
+
+# massage into matrix
+adjusted_close <- lapply(adjusted_stocks, Cl)
+adjusted_xts <- do.call(merge, adjusted_close)
+colnames(adjusted_xts) <- gsub("\\..*","", 
+                               colnames(adjusted_xts))
+df.close <- as.data.frame(adjusted_xts)
+df.close <- df.close[!duplicated(rownames(df.close)), 
+                     sapply(df.close, function(x) sum(is.na(x))/length(x) < .01)]
+
+# get period returns
+period_returns <- lapply(adjusted_stocks, function(stock) periodReturn(Cl(stock), 
+                                                                       period = periodicity, 
+                                                                       type = "arithmetic", 
+                                                                       leading = T))
+returns_xts <- do.call(merge, period_returns)
+colnames(returns_xts) <- colnames(adjusted_xts)
+df.return <- as.data.frame(returns_xts)
+df.return <- df.return[!duplicated(rownames(df.return)), 
+                       sapply(df.return, function(x){
+    sum(is.na(x))/length(x) == 0 & sum(is.infinite(x)) == 0
+})]
+
+
+# save data
+save(stocksList, 
+     adjusted_stocks, 
+     adjusted_xts, 
+     returns_xts,
+     df.close,
+     df.return,
+     file = paste0("stocks_adjusted_", periodicity, 
+                   "_", start_date, "_thru_", end_date, ".RData"))
+
+```
+
+
+
+# Principal Component Analysis
+
+
+```{r, message=F, echo=F}
+load(paste0("stocks_adjusted_", periodicity,  "_", start_date, "_thru_", end_date, ".RData"))
+```
+
+
+```{r, message=F}
+require(factoextra)
+require(FactoMineR)
+require(lubridate)
+require(gridExtra)
+suppressWarnings(invisible(capture.output(close.pca <- PCA(scale(df.close, center = T, scale = T), ncp = 20, graph = FALSE))))
+ncomp <- max(which(close.pca$eig[,3] < 90)) # ncomp to explain 90%
+```
+
+In the first part of our analysis, we used principal component analysis (PCA) to uncover the large scale structure of the market. We did this by working with the adjusted closing prices `df.close`, which have been filtered down from `r length(all_symbols)` to `r ncol(df.close)` stocks after removing missing data (due to stocks not being in existence for the entire record length specified). In the PCA plot, each point was colored by year so as to identify the temporal structure.
+
+```{r, echo = F, eval = F, message=F}
+scree <- fviz_screeplot(close.pca, 
+                        ncp = ncomp, 
+                        addlabels = TRUE, 
+                        ylim = c(0, 100)) + 
+    ggtitle("AMEX, NASDAQ, NYSE Adjusted Closing")
+scree
+```
+
+
+
+```{r, message = F}
+biplot.1.2 <- fviz_pca_biplot(close.pca, 
+                              axes = c(1,2), 
+                              geom = "point", 
+                              label = "none", 
+                              invisible = "var", 
+                              habillage = as.factor(year(rownames(df.close))), addEllipses = FALSE) + 
+    ggtitle("AMEX, NASDAQ, NYSE Adjusted Closing")
+suppressWarnings(print(biplot.1.2))
+```
+
+
+
+```{r, echo = F, eval = F, message = F}
+biplot.1.3 <- fviz_pca_biplot(close.pca, 
+                              axes = c(1,3), 
+                              geom = "point", 
+                              label = "none", 
+                              invisible = "var", 
+                              habillage = as.factor(year(rownames(df.close))), addEllipses = FALSE) + 
+    ggtitle("AMEX, NASDAQ, NYSE Adjusted Closing")
+suppressWarnings(print(biplot.1.3))
+```
+
+
+
+```{r, echo = F, eval = F, message = F}
+biplot.2.3 <- fviz_pca_biplot(close.pca, 
+                              axes = c(2,3), 
+                              geom = "point", 
+                              label = "none", 
+                              invisible = "var", 
+                              habillage = as.factor(year(rownames(df.close))), addEllipses = FALSE) + 
+    ggtitle("AMEX, NASDAQ, NYSE Adjusted Closing") 
+suppressWarnings(print(biplot.2.3))
+```
+
+
+## Eigenstocks
+
+A remarkable temporal structure can be seen in the PCA plot. We next examined the behavior of each principal component over time, especially in reference to the dates of major economic events ([wiki](https://en.wikipedia.org/wiki/List_of_stock_market_crashes_and_bear_markets)). To make things more interpretable, we only focused on the leading principal components, which we limited to those required to explain 90% of the variance. In this dataset, it required only `r ncomp` principal components to explain 90% of the variance. 
+
+```{r, message=F}
+require(pheatmap)
+ind <- get_pca_ind(close.pca)
+column.annotation <- data.frame(year = as.factor(year(rownames(df.close))))
+rownames(column.annotation) <- rownames(ind$coord)
+
+# quantile clipping for better visualization
+plot_matrix <- t(scale(ind$coord))[1:ncomp,]
+quantile_max <- max(abs(quantile(plot_matrix, c(.0025, .9975))))
+plot_matrix[plot_matrix > quantile_max] <- quantile_max
+plot_matrix[plot_matrix < -quantile_max] <- -quantile_max
+extremum <- max(abs(plot_matrix))
+
+event_dates <- data.frame(date = c("1997-10-27", 
+                                   "2000-03-10", 
+                                   "2001-09-10", 
+                                   "2002-10-09",
+                                   "2007-10-11", 
+                                   "2008-09-16",
+                                   "2010-05-06",
+                                   "2011-08-01",
+                                   "2015-08-18"),
+                          event = c("global crash",
+                                    "dot-com bubble",
+                                    "9/11",
+                                    "downturn",
+                                    "US bear market",
+                                    "financial crisis",
+                                    "flash crash",
+                                    "market fall",
+                                    "market selloff"))
+event_labels <- rep("", ncol(plot_matrix))
+event_indices <- which(colnames(plot_matrix) %in% event_dates$date)
+event_labels[event_indices] <- as.character(event_dates$event)
+
+require(RColorBrewer)
+pheatmap(plot_matrix, 
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100),
+         scale = "none", 
+         gaps_col = event_indices,
+         cluster_rows = FALSE, 
+         cluster_cols = FALSE, 
+         labels_col = event_labels,
+         show_colnames = TRUE, 
+         annotation_col = column.annotation, 
+         fontsize = 8,
+         main = "AMEX, NASDAQ, NYSE EigenStocks")
+
+
+```
+
+
+```{r}
+library(reshape2)
+library(ggplot2)
+library(lubridate)
+
+eig_zero <- as.data.frame(apply(ind$coord[,1:ncomp], 2, function(x) (x - x[1])))
+eig_zero$days <- as.numeric(as.Date(rownames(ind$coord))) - as.numeric(as.Date(rownames(ind$coord)[1]))
+event_dates.days <- as.numeric(as.Date(event_dates$date)) - as.numeric(as.Date(rownames(ind$coord)[1]))
+eig_zero.long <- melt(eig_zero, id.vars = "days")
+ggplot(data=eig_zero.long, 
+       aes(x=days, y=value, color = variable)) + 
+    geom_line() +
+    theme_bw() +
+    guides(colour = guide_legend(override.aes = list(size=3))) +
+    geom_vline(xintercept = event_dates.days, lty = "dotted", color = "black") +
+    ggtitle("Eigenstocks (1992-2017)")
+    
+```
+
+
+## Hub Stocks
+
+We identified the stocks most highly correlated with each principal component as "hubs", and listed them in ranked order below.
+
+```{r, message=F}
+sorted <- apply(close.pca$var$cor[,1:ncomp], 2, 
+                function(r) sort(r, decreasing = T, index.return = T)$ix)
+central_stocks <- apply(sorted, 2, 
+                        function(x) rownames(close.pca$var$cor)[x])
+```
+
+```{r, message=F, echo=F}
+kable(central_stocks[1:10,], format = "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+
+
+
+## Sectors and Industries
+
+We next examined what sectors and industries corresponded to each principal component using a hypergeometric test. We tested for enrichment using the top 100 or so stocks that are correlated with each principal component. Below we show the table of p-values, where only significant p-values are printed, and the color of each cell is scaled by $-\log{p}$, such that highly significant enrichments are red.
+
+```{r}
+# enrichment statistics
+enrich.test <- function(sample, background){
+    sample_counts <- table(sample)
+    sample_n <- sum(sample_counts)
+    background_counts <- table(background)
+    background_n <- sum(background_counts)
+    background_basis <- names(background_counts)
+    sample_counts <- sample_counts[background_basis]
+    sample_counts[is.na(sample_counts)] <- 0
+    names(sample_counts) <- background_basis
+    
+    # hypergeometric test
+    pvec <- sapply(1:length(background_basis), 
+                   function(i) phyper(sample_counts[i]-1, 
+                                      background_counts[i], 
+                                      background_n-background_counts[i], 
+                                      sample_n, 
+                                      lower.tail = F))
+    return(pvec)
+}
+
+# do test
+background <- stocksList$Sector
+samples <- lapply(1:ncomp, 
+                  function(pc) stocksList$Sector[match(central_stocks[1:110,pc], 
+                                                       stocksList$Symbol)])
+
+enrich.pvals <- sapply(samples,
+                       function(pc) enrich.test(pc, background))
+colnames(enrich.pvals) <- 1:ncomp
+
+pmask <- signif(enrich.pvals,2)
+pmask[enrich.pvals > 0.05] <- ""
+pheatmap(-log10(enrich.pvals), 
+         display_numbers = pmask,
+         main = "Sector Enrichments")
+```
+
+
+```{r}
+
+background <- stocksList$Industry
+samples <- lapply(1:ncomp, function(pc) stocksList$Industry[match(central_stocks[1:110,pc], 
+                                                                  stocksList$Symbol)])
+
+enrich.pvals <- sapply(samples, function(pc) enrich.test(pc, background))
+colnames(enrich.pvals) <- 1:ncomp
+
+# throw away industries that don't get enriched
+keep_industries <- rowSums(enrich.pvals < 0.05) > 0
+
+pmask <- signif(enrich.pvals,2)
+pmask[enrich.pvals > 0.05] <- ""
+pheatmap(-log10(enrich.pvals[keep_industries,]), 
+         display_numbers = pmask[keep_industries,], 
+         fontsize_row = 5, 
+         fontsize_number = 4,
+         main = "Industry Enrichments")
+```
+
+
+
+```{r, echo = F, eval = F}
+background <- stocksList$Exchange
+samples <- lapply(1:ncomp, function(pc) stocksList$Exchange[match(central_stocks[1:110,pc], 
+                                                                  stocksList$Symbol)])
+
+enrich.pvals <- sapply(samples, function(pc) enrich.test(pc, background))
+colnames(enrich.pvals) <- 1:ncomp
+
+pmask <- signif(enrich.pvals,2)
+pmask[enrich.pvals > 0.05] <- ""
+pheatmap(-log10(enrich.pvals), 
+         display_numbers = pmask,
+         main = "Exchange Enrichments")
+```
+
+
+# Weighted Correlation Network Analysis
+
+To try to improve upon the analysis done by spectral decomposition, we used the `WGCNA` package to create a correlation network. This method was originally designed for genomics (WGCNA stands for *Weighted Gene Coexpression Network Analysis*). It starts by computing the cross-correlation matrix, and then transforming the correlation matrix into a metric that is better suited for hierarchical clustering. In contrast to typical network analysis approaches, which simply threshold the correlation coefficient into zeros and ones to find edges, the method of `WGCNA` performs a type of "soft thresholding" to maintain a weighted edge between zero and one. To accomplish this, each element of the correlation matrix is raised to an exponent, which is chosen in order to make the network topology scale-free. This step is motivated by the work of Barabasi, who argues that biological networks (and most naturally evolved networks) are approximately scale-free by a principle of preferential attachment. While this theoretical motivation may or may not be justified in the case of stock market analysis, the soft thresholding procedure is generally desired in order to prepare the network for topological overlap analysis and hierarchical clustering. Below we generate a table of various network statistics that result by soft thresholding with various powers.
+
+
+```{r, message=F}
+invisible(require(WGCNA))
+r <- cor(df.close, use = "p")
+suppressWarnings(invisible(capture.output(sft <- pickSoftThreshold.fromSimilarity(r, 
+                                       powerVector = seq(from = 1, to = 100, by = 2),
+                                       networkType = "signed",
+                                       moreNetworkConcepts = TRUE))))
+```
+
+```{r, message=F, echo=F, eval=F}
+kable(sft$fitIndices[1:16,], format = "html", digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+It required a very large exponent to achieve an approximately scale free fit from this dataset (power = `r sft$powerEstimate`). However, the `TOMsimilarityFromExpr` function in `WGCNA` limits this power to a maximum of 30, and therefore our analysis is also limited. Using this as the soft thresholding exponent, we computed the topological overlap matrix and used hierarchical clustering to identify stock modules, which are shown by different colors underneath the dendrogram below.
+
+
+```{r, message = F}
+softpower <- min(sft$powerEstimate, 30)
+invisible(capture.output(TOM <- TOMsimilarityFromExpr(df.close, 
+                            networkType = "signed",
+                            power = softpower,
+                            TOMType = "signed")))
+dissTOM <- 1 - TOM
+stockTree <- hclust(as.dist(dissTOM), method = "average")
+invisible(capture.output(dynamicMods <- cutreeHybrid(dendro = stockTree,
+                           distM = dissTOM,
+                           cutHeight = NULL,
+                           minClusterSize = 20,
+                           deepSplit = 4,
+                           minSplitHeight = .05,
+                           pamStage = FALSE,
+                           pamRespectsDendro = TRUE)))
+dynamicColors <- labels2colors(dynamicMods$labels)
+ME <- moduleEigengenes(df.close, 
+                       dynamicColors,
+                       grey = "grey",
+                       excludeGrey = TRUE,
+                       impute = F, 
+                       softPower = softpower)
+MEs <- ME$eigengenes
+
+# plot dendrogram and modules
+plotDendroAndColors(stockTree, 
+                    dynamicColors,
+                    "modules",
+                    dendroLabels = FALSE, 
+                    hang = 0.03,
+                    addGuide = TRUE, 
+                    guideHang = 0.05)
+
+```
+
+## Stock Modules
+
+The network created by `WGCNA` had `r ncol(MEs)` modules, and for each module we computed the first principal component, or *module eigenstock*. It is natural to think of this as a systems level representation of the market, and to compute the correlation network between module eigenstocks to understand the higher level network. This can be visualized both using a heatmap, and using a network graph.
+
+```{r, message = F}
+r.eig <- cor(MEs)
+ph <- pheatmap(r.eig, 
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100), 
+         breaks = seq(-1,1,length.out = 100)
+         )
+```
+
+
+```{r, message = F}
+invisible(require(igraph))
+invisible(require(stringr))
+g <- graph_from_adjacency_matrix(r.eig, mode = "undirected", weighted = TRUE, diag = FALSE)
+V(g)$size <- 2 * as.numeric(table(dynamicColors)[str_replace_all(V(g)$name, "ME","")])^(1/2)
+V(g)$color <- str_replace_all(V(g)$name, "ME","")
+E(g)$width <- 4 * abs(E(g)$weight) ^2
+E(g)$color <- ifelse(E(g)$weight > 0, "red", "blue")
+
+g.thresh = delete.edges(g, which(abs(E(g)$weight) <=0))
+lay <- layout_in_circle(g.thresh, order = ph$tree_row$labels[ph$tree_row$order])
+plot(g.thresh, layout = lay, vertex.label = "", margin = c(-0,0,0,0), main = "Module Eigenstock Network", edge.curved = .1)
+```
+
+
+
+## Module Eigenstocks
+
+Next we examined the timecourse of each module eigenstock, with reference to the dates of major economic events, just as we did with the PCA eigenstocks.
+
+```{r, message = F}
+rownames(MEs) <- rownames(df.close)
+
+# quantile clipping for better visualization
+plot_matrix <- t(scale(MEs))
+quantile_max <- max(abs(quantile(plot_matrix, c(.0025, .9975))))
+plot_matrix[plot_matrix > quantile_max] <- quantile_max
+plot_matrix[plot_matrix < -quantile_max] <- -quantile_max
+extremum <- max(abs(plot_matrix))
+
+pheatmap(plot_matrix, 
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100),
+         scale = "none", 
+         gaps_col = event_indices,
+         cluster_rows = TRUE, 
+         cluster_cols = FALSE, 
+         labels_col = event_labels,
+         show_colnames = TRUE, 
+         annotation_col = column.annotation, 
+         fontsize = 8,
+         main = "AMEX, NASDAQ, NYSE EigenStocks")
+
+```
+
+```{r}
+MEs_zero <- as.data.frame(apply(scale(MEs), 2, function(x) (x - x[1])))
+MEs_zero$days <- as.numeric(as.Date(rownames(MEs))) - as.numeric(as.Date(rownames(MEs)[1]))
+event_dates.days <- as.numeric(as.Date(event_dates$date)) - as.numeric(as.Date(rownames(MEs)[1]))
+MEs_zero.long <- melt(MEs_zero, id.vars = "days")
+ggplot(data=MEs_zero.long, 
+       aes(x=days, y=value, color = variable)) + 
+    geom_line() +
+    scale_color_manual(values = sort(str_replace_all(colnames(MEs), "ME", ""))) + 
+    theme_bw() +
+    guides(colour = guide_legend(override.aes = list(size=3))) +
+    geom_vline(xintercept = event_dates.days, lty = "dotted", color = "black") +
+    ggtitle("Module Eigenstocks (1992-2017)")
+```
+
+
+## Module Hub Stocks
+
+To quantify module centrality, we computed the correlation of each stock to the module eigenstocks. We listed the top ranked stocks by this centrality metric below.
+
+```{r, message=F}
+stockModuleMembership = as.data.frame(cor(df.close, MEs, use = "p"));
+colnames(stockModuleMembership) <- sapply(strsplit(colnames(stockModuleMembership), "ME"), 
+                                          function(x) x[2])
+
+sorted <- apply(stockModuleMembership, 2, function(r) sort(r, decreasing = T, 
+                                                           index.return = T)$ix)
+central_stocks <- apply(sorted, 2, function(x) rownames(stockModuleMembership)[x])
+```
+
+
+```{r, echo=F, message=F}
+require(knitr)
+require(kableExtra)
+kable(central_stocks[1:10,], format = "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+
+## Module Sectors and Industries
+
+Next we tested for sectors and industries most overrepresented in each module. We did this as before, by taking the top 100 or so stocks that are correlated with each module eigenstock and using the hypergeometric test. Below we show the table of p-values, where only significant p-values are printed, and the color of each cell is scaled by $-\log{p}$, such that highly significant enrichments are red.
+
+```{r}
+
+background <- stocksList$Sector
+samples <- lapply(1:ncol(stockModuleMembership), function(pc) 
+    stocksList$Sector[match(central_stocks[1:110,pc], stocksList$Symbol)])
+
+enrich.pvals <- sapply(samples, function(pc) enrich.test(pc, background))
+colnames(enrich.pvals) <- colnames(stockModuleMembership)
+
+pmask <- signif(enrich.pvals,2)
+pmask[enrich.pvals > 0.05] <- ""
+pheatmap(-log10(enrich.pvals), 
+         display_numbers = pmask,
+         main = "Sector Enrichments")
+```
+
+
+```{r, message=F}
+
+background <- stocksList$Industry
+samples <- lapply(1:ncol(stockModuleMembership), function(pc) 
+    stocksList$Industry[match(central_stocks[1:110,pc], stocksList$Symbol)])
+
+enrich.pvals <- sapply(samples, function(pc) enrich.test(pc, background))
+colnames(enrich.pvals) <- colnames(stockModuleMembership)
+
+# throw away industries that don't get enriched
+keep_industries <- rowSums(enrich.pvals < 0.05) > 0
+
+pmask <- signif(enrich.pvals,2)
+pmask[enrich.pvals > 0.05] <- ""
+pheatmap(-log10(enrich.pvals[keep_industries,]), 
+         display_numbers = pmask[keep_industries,], 
+         fontsize_row = 5, 
+         fontsize_number = 4,
+         main = "Industry Enrichments")
+```
+
+```{r, eval = F, echo = F, message=F}
+
+background <- stocksList$Exchange
+samples <- lapply(1:ncol(stockModuleMembership), function(pc) 
+    stocksList$Exchange[match(central_stocks[1:110,pc], stocksList$Symbol)])
+
+enrich.pvals <- sapply(samples, function(pc) enrich.test(pc, background))
+colnames(enrich.pvals) <- colnames(stockModuleMembership)
+
+pmask <- signif(enrich.pvals,2)
+pmask[enrich.pvals > 0.05] <- ""
+pheatmap(-log10(enrich.pvals), 
+         display_numbers = pmask,
+         main = "Exchange Enrichments")
+```
+
+
+# Comparison of Eigenbases
+
+To understand the correspondence between the eigenbasis found using direct spectral decomposition, and the eigenbasis found by finding module eigenstocks in the weighted correlation network, we computed the cross-correlation between the two bases. The result is shown in a heatmap below, where correlation coefficients are printed within each cell.
+
+```{r}
+correspondence <- cor(MEs, ind$coord[,1:ncomp])
+pheatmap(correspondence, 
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100),
+         breaks = seq(-1, 1, length.out = 100),
+         display_numbers = TRUE,
+         cluster_cols = FALSE,
+         main = "Eigenstock Correspondence")
+```
+
+
+# Sector and Industry Aggregates
+
+We aggregated stocks from each sector and each industry, taking the mean adjusted closing price of each grouping, and analyzed their temporal trends.
+
+```{r}
+# sector aggregate
+agg.sector <- aggregate(t(df.close), 
+          by = list(stocksList$Sector[match(colnames(df.close), stocksList$Symbol)]), 
+          FUN = function(x) mean(x, na.rm = T))
+rownames(agg.sector) <- agg.sector$Group.1
+agg.sector <- agg.sector[,-1]
+
+
+# quantile clipping for better visualization
+plot_matrix <- t(scale(t(agg.sector)))
+quantile_max <- max(abs(quantile(plot_matrix, c(.0025, .9975), na.rm=TRUE)))
+plot_matrix[plot_matrix > quantile_max] <- quantile_max
+plot_matrix[plot_matrix < -quantile_max] <- -quantile_max
+extremum <- max(abs(plot_matrix))
+
+pheatmap(plot_matrix, 
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100),
+         scale = "none", 
+         gaps_col = event_indices,
+         cluster_rows = TRUE, 
+         cluster_cols = FALSE, 
+         labels_col = event_labels,
+         show_colnames = TRUE, 
+         annotation_col = column.annotation, 
+         fontsize = 8,
+         main = "AMEX, NASDAQ, NYSE EigenStocks")
+
+
+```
+
+
+```{r, fig.height = 15}
+# industry aggregate
+agg.industry <- aggregate(t(df.close), 
+          by = list(stocksList$Industry[match(colnames(df.close), stocksList$Symbol)]), 
+          FUN = function(x) mean(x, na.rm = T))
+rownames(agg.industry) <- agg.industry$Group.1
+agg.industry <- agg.industry[,-1]
+
+# quantile clipping for better visualization
+plot_matrix <- t(scale(t(agg.industry)))
+quantile_max <- max(abs(quantile(plot_matrix, c(.0025, .9975), na.rm=TRUE)))
+plot_matrix[plot_matrix > quantile_max] <- quantile_max
+plot_matrix[plot_matrix < -quantile_max] <- -quantile_max
+extremum <- max(abs(plot_matrix))
+
+pheatmap(plot_matrix, 
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100),
+         scale = "none", 
+         gaps_col = event_indices,
+         cluster_rows = TRUE, 
+         cluster_cols = FALSE, 
+         labels_col = event_labels,
+         show_colnames = TRUE, 
+         annotation_col = column.annotation, 
+         fontsize = 8,
+         fontsize_row = 5,
+         main = "AMEX, NASDAQ, NYSE EigenStocks")
+```
+
+
+
+# Risk and Reward
+
+Here we analyze the stocks in terms of risk and reward. Rewarding stocks have a higher mean of the log returns (measure of growth). Riskier stocks have a higher standard deviation of the log returns (measure of volatility).
+
+```{r, eval = F}
+# compute returns
+
+returns_stocks <- lapply(adjusted_stocks, function(stock) periodReturn(Cl(stock), 
+                                                                       period = periodicity, 
+                                                                       type = "log", 
+                                                                       leading = T))
+
+returns_stocks_xts <- do.call(merge, returns_stocks)
+colnames(returns_stocks_xts) <- colnames(adjusted_xts)
+log_returns <- as.data.frame(returns_stocks_xts)
+
+# filter the Infs
+log_returns[which(log_returns == Inf | log_returns == -Inf, arr.ind = T)] <- NA
+save(log_returns, file = "log_returns.RData")
+```
+
+
+
+```{r}
+invisible(require(ggrepel))
+load("log_returns.RData")
+returns.mean <- apply(log_returns, 2, function(x) mean(x, na.rm = T))
+returns.sd <- apply(log_returns, 2, function(x) sd(x, na.rm = T))
+risk_reward <- data.frame(log_return = returns.mean, 
+                          standard_deviation = returns.sd, 
+                          name = names(returns.mean),
+                          sector = stocksList$Sector[match(names(returns.mean), stocksList$Symbol)],
+                          module = dynamicColors[match(names(returns.mean), colnames(df.close))])
+
+group_color_names <- as.character(na.omit(unique(risk_reward$module[risk_reward$module != "grey"])))
+
+plot_dat <- subset(risk_reward, standard_deviation < .1 & module != "grey")
+ggplot(plot_dat, 
+       aes(x = standard_deviation, y = log_return, color = module)) +  
+    geom_point(size = 1, alpha = .3) + 
+    theme_bw() + 
+    scale_color_manual(values = sort(group_color_names)) +
+    geom_text_repel(
+        data = subset(plot_dat, log_return > .0008),
+        aes(label = name),
+        size = 3,
+        box.padding = unit(0.35, "lines"),
+        point.padding = unit(0.3, "lines")) +
+    xlab("Risk (volatility)") + ylab("Reward (log returns)") + ggtitle("Risk vs. Reward (1992-2017)")
+
+
+    
+```
+
+
+
+```{r}
+start.recent <- seq(as.Date(end_date), length=2, by="-5 years")[2]
+recent.row.ix <- which(rownames(log_returns) == start.recent):nrow(log_returns)
+returns.mean.recent <- apply(log_returns[recent.row.ix,], 2, function(x) mean(x, na.rm = T))
+returns.sd.recent <- apply(log_returns[recent.row.ix,], 2, function(x) sd(x, na.rm = T))
+risk_reward.recent <- data.frame(log_return = returns.mean.recent, 
+                          standard_deviation = returns.sd.recent, 
+                          name = names(returns.mean),
+                          sector = stocksList$Sector[match(names(returns.mean), stocksList$Symbol)],
+                          module = dynamicColors[match(names(returns.mean), colnames(df.close))])
+
+group_color_names <- as.character(na.omit(unique(risk_reward$module[risk_reward$module != "grey"])))
+
+plot_dat.recent <- subset(risk_reward.recent, standard_deviation < .1 & module != "grey")
+ggplot(plot_dat.recent, 
+       aes(x = standard_deviation, y = log_return, color = module)) +  
+    geom_point(size = 1, alpha = .3) + 
+    theme_bw() + 
+    scale_color_manual(values = sort(group_color_names)) +
+    geom_text_repel(
+        data = subset(plot_dat.recent, log_return > .0012),
+        aes(label = name),
+        size = 3,
+        box.padding = unit(0.35, "lines"),
+        point.padding = unit(0.3, "lines")) +
+    xlab("Risk (volatility)") + ylab("Reward (log returns)") + ggtitle("Risk vs. Reward (2012-2017)")
+
+
+    
+```
+
+
+Finally, we pick stocks that have had log returns in the upper decile in both the long term (25 years) and the short term (5 years). Of these, we sort by the average volatility in order to minimize risk, and we view the top 5:
+
+```{r}
+combined_dat <- cbind(plot_dat, plot_dat.recent[rownames(plot_dat),])
+combined_log_return <- combined_dat[,c(1,6,4,5,3)]
+combined_volatility <- combined_dat[,c(2,7,4,5)]
+combined_log_return$avg_log_return <- rowMeans(combined_log_return[,c(1,2)], na.rm = T)
+combined_log_return$volatility <- 10^rowMeans(log10(combined_volatility[,c(1,2)]), na.rm = T)
+
+
+
+
+high_reward <- subset(combined_log_return, 
+                      combined_log_return$log_return > quantile(combined_log_return$log_return, .9, na.rm = T) & 
+                          combined_log_return$log_return.1 > quantile(combined_log_return$log_return.1, .9, na.rm = T))
+
+minimize_volatility <- sort(combined_volatility[rownames(high_reward),1] * combined_volatility[rownames(high_reward),2], decreasing = F, index.return = T)
+
+plot_dat.recent <- combined_log_return
+show_dat_names <- subset(combined_log_return[,-c(1,2)], 
+                         avg_log_return > quantile(combined_log_return$avg_log_return, .9, na.rm=T) & 
+                             volatility < quantile(combined_log_return$volatility, .7, na.rm=T))
+ggplot(plot_dat.recent, 
+       aes(x = volatility, y = avg_log_return, color = module)) +  
+    geom_point(size = 1, alpha = .3) + 
+    theme_bw() + 
+    scale_color_manual(values = sort(group_color_names)) +
+    geom_text_repel(
+        data = show_dat_names,
+        aes(label = name),
+        size = 3,
+        box.padding = unit(0.35, "lines"),
+        point.padding = unit(0.3, "lines")) +
+    xlab("Risk (volatility)") + ylab("Reward (log returns)") + ggtitle("Average Risk vs. Average Reward (5yr and 25yr)")
+
+
+
+```
+
+```{r}
+kable(show_dat_names, format = "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+
+```{r, eval = F}
+
+for(stock in rownames(high_reward)[minimize_volatility$ix[1:5]]){
+    chartSeries(adjusted_xts[, stock], name = stock, theme = "white")
+}
+```
+
+
